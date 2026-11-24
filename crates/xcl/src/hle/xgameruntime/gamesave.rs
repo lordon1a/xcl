@@ -135,8 +135,22 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // MoveFileExW takes paths past MAX_PATH only in their "\\?\" form (std::fs, which
+        // wrote the temp file, adds it itself): a long container name otherwise fails here
+        let verbatim = |p: &Path| -> std::io::Result<Vec<u16>> {
+            let abs = std::path::absolute(p)?;
+            let s = abs.as_os_str().to_string_lossy();
+            let v = if s.starts_with(r"\\?\") {
+                abs.into_os_string()
+            } else if let Some(unc) = s.strip_prefix(r"\\") {
+                format!(r"\\?\UNC\{unc}").into()
+            } else {
+                format!(r"\\?\{s}").into()
+            };
+            Ok(v.encode_wide().chain(std::iter::once(0)).collect())
+        };
+        let src = verbatim(tmp)?;
+        let dst = verbatim(dest)?;
         // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
         let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
         if ok != 0 {
@@ -619,6 +633,24 @@ mod tests {
     use crate::util::{E_ABORT, E_PENDING};
 
     const DELETE_TEST_NAME: &str = "slot/1";
+
+    /// A blob whose path is longer than MAX_PATH (a long container name under the data folder)
+    /// is saved: the files are written through Rust's `std::fs`, which takes long paths, and
+    /// the final move took only paths under 260 characters (ERROR_PATH_NOT_FOUND past them).
+    #[test]
+    fn a_blob_past_max_path_is_saved() {
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-long-path-{}", std::process::id()));
+        let dir = root.join("a".repeat(200));
+        let ops = [("data".to_string(), Some(b"v".to_vec()))];
+        let hr = apply(&dir, Some("Long"), &ops);
+        let data = std::fs::read(dir.join("b").join("data")).ok();
+        let display = std::fs::read_to_string(dir.join("display")).ok();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(dir.join("b").join("data").as_os_str().len() > 260);
+        assert_eq!(hr, S_OK);
+        assert_eq!(data.as_deref(), Some(&b"v"[..]));
+        assert_eq!(display.as_deref(), Some("Long"));
+    }
 
     struct DeleteFixture {
         root: PathBuf,
