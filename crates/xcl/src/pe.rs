@@ -606,8 +606,10 @@ impl OwnedExports {
         let mut out = OwnedExports::default();
         if let Some(ex) = pe.exports()? {
             for (i, &rva) in ex.functions.iter().enumerate() {
+                // the base comes from the file: an entry past u32::MAX has no ordinal
+                let Some(ordinal) = ex.ordinal_base.checked_add(i as u32) else { break };
                 if let Some(t) = pe.export_target(&ex, rva) {
-                    out.by_ordinal.insert(ex.ordinal_base + i as u32, t);
+                    out.by_ordinal.insert(ordinal, t);
                 }
             }
             for (name, idx) in &ex.names {
@@ -719,6 +721,25 @@ mod tests {
             assert_eq!(pe.u64_at(rva), Some(0));
             assert!(matches!(pe.tls(), Err(PeError::BadRva(_))), "offset {offset}");
         }
+    }
+
+    /// The ordinal base comes from the file: an export past u32::MAX is no ordinal and is skipped
+    /// (it panicked on overflow in debug builds and wrapped to ordinal 0 in release ones).
+    #[test]
+    fn export_ordinals_past_u32_max_are_skipped() {
+        let rva = 0x1000u32;
+        let mut payload = vec![0u8; 48];
+        payload[16..20].copy_from_slice(&u32::MAX.to_le_bytes()); // Base
+        payload[20..24].copy_from_slice(&2u32.to_le_bytes()); // NumberOfFunctions
+        payload[28..32].copy_from_slice(&(rva + 40).to_le_bytes()); // AddressOfFunctions
+        payload[40..44].copy_from_slice(&0x2000u32.to_le_bytes());
+        payload[44..48].copy_from_slice(&0x2004u32.to_le_bytes());
+        let data = directory_at_rva(DIR_EXPORT, rva, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        let ex = OwnedExports::from_pe(&pe).unwrap();
+        assert_eq!(ex.by_ordinal.len(), 1);
+        assert_eq!(ex.by_ordinal.get(&u32::MAX), Some(&ExportTarget::Rva(0x2000)));
+        assert!(!ex.by_ordinal.contains_key(&0));
     }
 
     #[test]
